@@ -13,7 +13,7 @@ import psutil
 
 import config
 from streamer import stream_manager
-from downloader import VideoDownloader
+from downloader import download_video
 from file_manager import file_manager
 from channel_manager import channel_manager
 from settings_manager import settings_manager
@@ -26,7 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("WorkerNode")
 
-downloader = VideoDownloader()
 WORKER_START_TIME = time.time()
 
 # --- SECURITY MIDDLEWARE ---
@@ -145,7 +144,7 @@ async def handle_start_stream(request: web.Request) -> web.Response:
         if video_url:
             logger.info(f"Downloading stream source video from {video_url}...")
             try:
-                target_path = await downloader.download(video_url)
+                target_path = await download_video(video_url)
             except Exception as e:
                 return web.json_response({"error": f"Failed to download video: {str(e)}"}, status=500)
         else:
@@ -238,7 +237,7 @@ async def handle_download_file(request: web.Request) -> web.Response:
         return web.json_response({"error": "url is required"}, status=400)
 
     try:
-        downloaded_path = await downloader.download(url)
+        downloaded_path = await download_video(url)
         return web.json_response({
             "status": "success",
             "filename": downloaded_path.name,
