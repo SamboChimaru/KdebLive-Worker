@@ -166,12 +166,14 @@ async def handle_start_stream(request: web.Request) -> web.Response:
 
         if file_id:
             target_path = file_manager.get_file(file_id)
-        elif video_path_str:
+        if (not target_path or not target_path.exists()) and video_path_str:
             candidate = Path(video_path_str)
-            if candidate.is_absolute():
+            if candidate.is_absolute() and candidate.exists():
                 target_path = candidate
+            elif (config.DOWNLOAD_DIR / candidate.name).exists():
+                target_path = config.DOWNLOAD_DIR / candidate.name
             else:
-                target_path = config.DOWNLOAD_DIR / candidate
+                target_path = file_manager.get_file(candidate.name)
 
         # If URL provided and no local file, download on this worker node
         if not target_path or not target_path.exists():
