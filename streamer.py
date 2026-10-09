@@ -252,80 +252,88 @@ class StreamManager:
         width = int(video_info.get("width", 0))
         has_audio = video_info.get("has_audio", True)
         is_aac = video_info.get("is_aac", True)
+        vcodec = video_info.get("vcodec", "").lower()
+        can_copy_v = (vcodec in ("h264", "avc1"))
+
+        # Meta Facebook Live & YouTube strictly mandate 48 kHz AAC audio
+        audio_args = ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
 
         # Mode handling
-        if quality_mode == "copy" and not session.is_playlist:
-            # Direct stream-copy only for single files with matching codecs
+        if quality_mode == "copy" and not session.is_playlist and can_copy_v:
+            # Direct stream-copy only for single files with H.264 video codec
             cmd.extend(["-c:v", "copy"])
             if has_audio:
                 if is_aac:
                     cmd.extend(["-c:a", "copy"])
                 else:
-                    cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"])
+                    cmd.extend(audio_args)
             else:
                 cmd.extend(["-an"])
             session.codec_mode = "Stream-Copy (Direct pass)"
 
-        elif quality_mode == "720p":
-            # 720p HD mode with strict 2-second keyframe cadence (GOP = 60 @ 30fps)
-            vf_filter = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30" if session.is_playlist else "scale=-2:720"
+        elif quality_mode == "720p" or (quality_mode == "copy" and not can_copy_v and (height <= 720 and width <= 1280)):
+            # 720p HD mode with strict Constant Bitrate (CBR) and 2-second keyframe cadence (GOP = 60 @ 30fps)
+            vf_filter = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30" if session.is_playlist else "scale=-2:720,fps=30"
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
+                "-preset", "veryfast",
                 "-tune", "zerolatency",
                 "-vf", vf_filter,
                 "-r", "30",
                 "-b:v", "2800k",
-                "-maxrate", "3000k",
-                "-bufsize", "6000k",
+                "-minrate", "2800k",
+                "-maxrate", "2800k",
+                "-bufsize", "2800k",
+                "-x264-params", "nal-hrd=cbr:force-cfr=1",
                 "-pix_fmt", "yuv420p",
                 "-g", "60",
                 "-keyint_min", "60",
                 "-sc_threshold", "0",
             ])
             if has_audio:
-                cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"])
+                cmd.extend(audio_args)
             else:
                 cmd.extend(["-an"])
             session.codec_mode = "720p HD"
 
         else:
-            # 1080p Full HD mode (Default)
+            # 1080p Full HD mode (Default) with strict Constant Bitrate (CBR)
             if session.is_playlist:
                 vf_filter = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30"
             elif height > 1080 or width > 1920:
-                vf_filter = "scale=-2:1080"
+                vf_filter = "scale=-2:1080,fps=30"
             else:
-                vf_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+                vf_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30"
 
             scale_args = ["-vf", vf_filter] if vf_filter else []
-            bitrate = "4800k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "3000k"
-            maxrate = "5000k" if bitrate == "4800k" else "3200k"
-            bufsize = "10000k" if bitrate == "4800k" else "6400k"
-            mode_name = "1080p Full HD"
+            bitrate = "4500k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "2800k"
+            mode_name = "1080p Full HD" if bitrate == "4500k" else "720p HD"
 
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
+                "-preset", "veryfast",
                 "-tune", "zerolatency",
                 *scale_args,
                 "-r", "30",
                 "-b:v", bitrate,
-                "-maxrate", maxrate,
-                "-bufsize", bufsize,
+                "-minrate", bitrate,
+                "-maxrate", bitrate,
+                "-bufsize", bitrate,
+                "-x264-params", "nal-hrd=cbr:force-cfr=1",
                 "-pix_fmt", "yuv420p",
                 "-g", "60",
                 "-keyint_min", "60",
                 "-sc_threshold", "0",
             ])
             if has_audio:
-                cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"])
+                cmd.extend(audio_args)
             else:
                 cmd.extend(["-an"])
             session.codec_mode = f"{mode_name}"
 
-        # RTMP FLV output
+        # RTMP FLV output with packet flushing
         cmd.extend([
+            "-fflags", "+nobuffer+flush_packets",
             "-flvflags", "no_duration_filesize",
             "-f", "flv",
             session.rtmp_url
@@ -432,7 +440,12 @@ class StreamManager:
                     except Exception:
                         pass
 
-                clean_err = f"FFmpeg exited (code {process.returncode}): {err_detail}" if err_detail else f"FFmpeg exited immediately with code {process.returncode}."
+                if any(k in err_detail.lower() for k in ("tls fatal", "handshake")):
+                    clean_err = f"Stream key rejected or expired by platform ({err_detail}). In Facebook Live Producer, please check that your live post is open or generate a new stream key."
+                elif "input/output error" in err_detail.lower():
+                    clean_err = f"Remote RTMP connection rejected ({err_detail}). Stream key may have already ended or expired."
+                else:
+                    clean_err = f"FFmpeg exited (code {process.returncode}): {err_detail}" if err_detail else f"FFmpeg exited immediately with code {process.returncode}."
                 session.status = "ERROR"
                 session.error_message = clean_err
                 self.last_errors[session.channel_name] = clean_err
