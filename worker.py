@@ -232,7 +232,9 @@ async def handle_start_stream(request: web.Request) -> web.Response:
             "file_size_str": file_size_str
         })
     else:
-        return web.json_response({"error": "Failed to start FFmpeg process"}, status=500)
+        session = stream_manager.get_session(channel_name)
+        err_msg = session.error_message if (session and session.error_message) else "Failed to start FFmpeg process"
+        return web.json_response({"error": err_msg}, status=500)
 
 async def handle_stop_stream(request: web.Request) -> web.Response:
     """Stops one or all streams."""

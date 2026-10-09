@@ -294,7 +294,7 @@ class StreamManager:
             elif height > 1080 or width > 1920:
                 vf_filter = "scale=-2:1080"
             else:
-                vf_filter = None
+                vf_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
 
             scale_args = ["-vf", vf_filter] if vf_filter else []
             bitrate = "4800k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "3000k"
@@ -322,7 +322,7 @@ class StreamManager:
                 else:
                     cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
             else:
-                cmd.extend(["-c:a", "aac"])
+                cmd.extend(["-an"])
             session.codec_mode = f"{mode_name}"
 
         # RTMP FLV output
@@ -417,11 +417,26 @@ class StreamManager:
             session.reader_task = asyncio.create_task(self._read_ffmpeg_output(session, process, log_file))
 
             # Quick verification that process didn't instantly crash (e.g. invalid RTMP key or closed socket)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.5)
             if process.returncode is not None:
+                err_detail = ""
+                if log_file_path.exists():
+                    try:
+                        raw = log_file_path.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+                        err_lines = [l.strip() for l in raw if l.strip() and not l.strip().startswith("frame=")]
+                        for l in reversed(err_lines):
+                            if any(k in l.lower() for k in ("error", "failed", "cannot", "invalid", "refused", "reset", "denied", "i/o")):
+                                err_detail = l
+                                break
+                        if not err_detail and err_lines:
+                            err_detail = err_lines[-1]
+                    except Exception:
+                        pass
+
+                clean_err = f"FFmpeg exited (code {process.returncode}): {err_detail}" if err_detail else f"FFmpeg exited immediately with code {process.returncode}."
                 session.status = "ERROR"
-                session.error_message = f"FFmpeg exited immediately with code {process.returncode}."
-                logger.error(f"FFmpeg for [{session.channel_name}] exited immediately with code {process.returncode}")
+                session.error_message = clean_err
+                logger.error(f"FFmpeg for [{session.channel_name}] exited immediately: {clean_err}")
                 return False
 
             return True

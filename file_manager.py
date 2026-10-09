@@ -69,7 +69,7 @@ class FileManager:
                         "file_id": file_id,
                         "filename": p.name,
                         "display_name": clean_name,
-                        "path": p,
+                        "path": str(p),
                         "size_bytes": size_bytes,
                         "size_mb": size_mb,
                         "size_str": size_str,
