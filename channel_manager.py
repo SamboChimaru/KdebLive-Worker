@@ -11,6 +11,28 @@ PLATFORM_ENDPOINTS = {
     "twitch": "rtmp://live.twitch.tv/app/{stream_key}",
 }
 
+def sanitize_stream_key(key: str, platform: str) -> str:
+    """Cleans up pasted stream key by removing full RTMP/RTMPS URLs and outer quotes/slashes."""
+    if not key:
+        return ""
+    k = key.strip().strip("'\"`")
+    plat = platform.lower()
+    if plat in ("facebook", "fb", "fblive"):
+        if "/rtmp/" in k:
+            k = k.split("/rtmp/", 1)[1].strip()
+        k = k.lstrip("/")
+    elif plat in ("youtube", "yt", "ytb"):
+        if "/live2/" in k:
+            k = k.split("/live2/", 1)[1].strip()
+        elif "/live/" in k:
+            k = k.split("/live/", 1)[1].strip()
+        k = k.lstrip("/")
+    elif plat in ("twitch", "tw"):
+        if "/app/" in k:
+            k = k.split("/app/", 1)[1].strip()
+        k = k.lstrip("/")
+    return k
+
 class ChannelManager:
     """Manages saved streaming channel configurations (YouTube, Facebook, etc.)."""
 
@@ -43,7 +65,7 @@ class ChannelManager:
         """Adds or updates a channel."""
         name = name.strip().lower()
         platform = platform.strip().lower()
-        stream_key = stream_key.strip()
+        stream_key = sanitize_stream_key(stream_key, platform)
 
         if platform not in PLATFORM_ENDPOINTS and platform != "custom":
             raise ValueError(f"Unsupported platform: {platform}. Supported: youtube, facebook, twitch, custom")
@@ -84,7 +106,7 @@ class ChannelManager:
             return None
 
         platform = ch["platform"]
-        key = ch["stream_key"]
+        key = sanitize_stream_key(ch["stream_key"], platform)
 
         if platform in PLATFORM_ENDPOINTS:
             return PLATFORM_ENDPOINTS[platform].format(stream_key=key)

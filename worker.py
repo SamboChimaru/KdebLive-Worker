@@ -233,7 +233,7 @@ async def handle_start_stream(request: web.Request) -> web.Response:
         })
     else:
         session = stream_manager.get_session(channel_name)
-        err_msg = session.error_message if (session and session.error_message) else "Failed to start FFmpeg process"
+        err_msg = stream_manager.get_last_error(channel_name) or (session.error_message if session else None) or "Failed to start FFmpeg process"
         return web.json_response({"error": err_msg}, status=500)
 
 async def handle_stop_stream(request: web.Request) -> web.Response:
@@ -373,6 +373,55 @@ async def handle_delete_channel(request: web.Request) -> web.Response:
     return web.json_response({"error": f"Channel [{name}] not found"}, status=404)
 
 
+# --- LOGS & UPDATE ROUTES ---
+
+async def handle_get_logs(request: web.Request) -> web.Response:
+    """Returns recent lines from stream logs or worker log."""
+    channel = request.query.get("channel", "").strip().lower()
+    if channel:
+        log_file = config.LOGS_DIR / f"{channel}_ffmpeg.log"
+    else:
+        logs = list(config.LOGS_DIR.glob("*.log"))
+        if logs:
+            log_file = sorted(logs, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+        else:
+            return web.json_response({"error": "No log files found"}, status=404)
+    if not log_file.exists():
+        return web.json_response({"error": f"Log file for channel [{channel}] not found"}, status=404)
+    try:
+        raw = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        tail = raw[-100:] if len(raw) > 100 else raw
+        return web.json_response({"file": log_file.name, "lines": tail})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_system_update(request: web.Request) -> web.Response:
+    """Pulls latest git updates and restarts the live-worker service."""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            "git pull",
+            cwd=str(config.BASE_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        out = stdout.decode().strip()
+        err = stderr.decode().strip()
+
+        async def delayed_restart():
+            await asyncio.sleep(1.0)
+            await asyncio.create_subprocess_shell("sudo systemctl restart live-worker")
+
+        asyncio.create_task(delayed_restart())
+        return web.json_response({
+            "status": "success",
+            "git_output": out,
+            "git_error": err,
+            "message": "Update pulled successfully. Service restarting in 1 second."
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 # --- APPLICATION SETUP ---
 
 def create_app() -> web.Application:
@@ -382,6 +431,8 @@ def create_app() -> web.Application:
     app.router.add_get("/", handle_ping)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/api/health", handle_health)
+    app.router.add_get("/api/logs", handle_get_logs)
+    app.router.add_post("/api/system/update", handle_system_update)
 
     # Streams
     app.router.add_get("/api/streams", handle_list_streams)

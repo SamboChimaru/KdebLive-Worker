@@ -124,6 +124,11 @@ class StreamManager:
 
     def __init__(self):
         self.sessions: Dict[str, StreamSession] = {}
+        self.last_errors: Dict[str, str] = {}
+
+    def get_last_error(self, channel_name: str) -> Optional[str]:
+        """Returns the most recent startup failure error for a channel."""
+        return self.last_errors.get(channel_name)
 
     def get_active_video_paths(self) -> Set[str]:
         """Returns paths of video files currently in use by active streams."""
@@ -256,9 +261,9 @@ class StreamManager:
                 if is_aac:
                     cmd.extend(["-c:a", "copy"])
                 else:
-                    cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
+                    cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"])
             else:
-                cmd.extend(["-c:a", "aac"])
+                cmd.extend(["-an"])
             session.codec_mode = "Stream-Copy (Direct pass)"
 
         elif quality_mode == "720p":
@@ -279,12 +284,9 @@ class StreamManager:
                 "-sc_threshold", "0",
             ])
             if has_audio:
-                if is_aac and not session.is_playlist:
-                    cmd.extend(["-c:a", "copy"])
-                else:
-                    cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
+                cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"])
             else:
-                cmd.extend(["-c:a", "aac"])
+                cmd.extend(["-an"])
             session.codec_mode = "720p HD"
 
         else:
@@ -317,10 +319,7 @@ class StreamManager:
                 "-sc_threshold", "0",
             ])
             if has_audio:
-                if is_aac and not session.is_playlist:
-                    cmd.extend(["-c:a", "copy"])
-                else:
-                    cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
+                cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"])
             else:
                 cmd.extend(["-an"])
             session.codec_mode = f"{mode_name}"
@@ -425,7 +424,7 @@ class StreamManager:
                         raw = log_file_path.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
                         err_lines = [l.strip() for l in raw if l.strip() and not l.strip().startswith("frame=")]
                         for l in reversed(err_lines):
-                            if any(k in l.lower() for k in ("error", "failed", "cannot", "invalid", "refused", "reset", "denied", "i/o")):
+                            if any(k in l.lower() for k in ("error", "failed", "cannot", "invalid", "refused", "reset", "denied", "i/o", "end of file", "handshake", "tls", "connection")):
                                 err_detail = l
                                 break
                         if not err_detail and err_lines:
@@ -436,6 +435,7 @@ class StreamManager:
                 clean_err = f"FFmpeg exited (code {process.returncode}): {err_detail}" if err_detail else f"FFmpeg exited immediately with code {process.returncode}."
                 session.status = "ERROR"
                 session.error_message = clean_err
+                self.last_errors[session.channel_name] = clean_err
                 logger.error(f"FFmpeg for [{session.channel_name}] exited immediately: {clean_err}")
                 return False
 
@@ -443,6 +443,7 @@ class StreamManager:
         except Exception as e:
             session.status = "ERROR"
             session.error_message = str(e)
+            self.last_errors[session.channel_name] = str(e)
             logger.error(f"Failed to start FFmpeg for [{session.channel_name}]: {e}")
             return False
 
@@ -634,8 +635,11 @@ class StreamManager:
         success = await self._launch_process(session)
         if success:
             session.monitor_task = asyncio.create_task(self._monitor_stream(session))
+            self.last_errors.pop(channel_name, None)
             return True
         else:
+            if not self.last_errors.get(channel_name):
+                self.last_errors[channel_name] = session.error_message or "Failed to start FFmpeg process"
             if channel_name in self.sessions:
                 try:
                     del self.sessions[channel_name]
