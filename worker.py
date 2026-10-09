@@ -213,6 +213,14 @@ async def handle_start_stream(request: web.Request) -> web.Response:
 
     if started:
         session = stream_manager.get_session(channel_name)
+        file_size_str = ""
+        if target_path and target_path.exists():
+            try:
+                sz_mb = target_path.stat().st_size / (1024 * 1024)
+                file_size_str = f"{sz_mb / 1024:.2f} GB" if sz_mb >= 1024 else f"{sz_mb:.1f} MB"
+            except Exception:
+                pass
+
         return web.json_response({
             "status": "success",
             "channel": channel_name,
@@ -220,7 +228,8 @@ async def handle_start_stream(request: web.Request) -> web.Response:
             "is_playlist": bool(playlist_files),
             "playlist_count": len(playlist_files),
             "now_playing": session.now_playing if session else target_path.name,
-            "video_name": target_path.name
+            "video_name": target_path.name,
+            "file_size_str": file_size_str
         })
     else:
         return web.json_response({"error": "Failed to start FFmpeg process"}, status=500)
