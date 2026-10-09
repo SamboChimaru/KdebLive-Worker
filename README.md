@@ -16,7 +16,7 @@ This repository is **completely standalone, open-source, and contains zero bot t
 SSH into your AWS instance and run:
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/YOUR_PUBLIC_WORKER_REPO.git ~/live-worker
+git clone https://github.com/SamboChimaru/KdebLive-Worker.git ~/live-worker
 cd ~/live-worker
 sudo bash start_worker.sh
 ```

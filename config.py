@@ -25,6 +25,15 @@ RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))
 # Disk cleanup threshold: percentage of free disk space before purging old videos
 DISK_MIN_FREE_PERCENT = float(os.getenv("DISK_MIN_FREE_PERCENT", "15.0"))
 
+# Watchdog & Auto-Healing Settings
+WATCHDOG_CHECK_INTERVAL = int(os.getenv("WATCHDOG_CHECK_INTERVAL", "3"))  # Interval in seconds to inspect FFmpeg health
+STALL_TIMEOUT_SECONDS = int(os.getenv("STALL_TIMEOUT_SECONDS", "18"))  # Max seconds without frame progress before declaring freeze
+WATCHDOG_MAX_AUTO_HEAL = int(os.getenv("WATCHDOG_MAX_AUTO_HEAL", "50"))  # Max automatic heal restarts per session
+RAM_AUTO_CLEAN_PERCENT = float(os.getenv("RAM_AUTO_CLEAN_PERCENT", "88.0"))  # Auto-clean disk cache if RAM exceeds this %
+DISK_AUTO_CLEAN_PERCENT = float(os.getenv("DISK_AUTO_CLEAN_PERCENT", "85.0"))  # Auto-clean disk cache if Disk exceeds this %
+PLAYLIST_DIR = DATA_DIR / "playlists"
+PLAYLIST_DIR.mkdir(parents=True, exist_ok=True)
+
 # Worker Node Settings (for AWS streaming agent)
 WORKER_PORT = int(os.getenv("WORKER_PORT", "8000"))
 WORKER_HOST = os.getenv("WORKER_HOST", "0.0.0.0")

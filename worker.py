@@ -33,20 +33,35 @@ WORKER_START_TIME = time.time()
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
     # Allow public access to root ping and health check
-    if request.path in ("/", "/health", "/api/ping"):
+    if request.path in ("/", "/health", "/api/ping", "/api/health"):
+        return await handler(request)
+
+    # Check expected API key
+    expected_key = getattr(config, "WORKER_API_KEY", "").strip()
+    if not expected_key or expected_key.lower() in ("none", "disabled", "false"):
         return await handler(request)
 
     # Validate API Key
-    api_key = request.headers.get("X-API-Key", "")
+    api_key = request.headers.get("X-API-Key", "").strip()
     if not api_key:
-        auth_header = request.headers.get("Authorization", "")
+        auth_header = request.headers.get("Authorization", "").strip()
         if auth_header.startswith("Bearer "):
             api_key = auth_header[7:].strip()
 
-    expected_key = config.WORKER_API_KEY
-    if not expected_key or not hmac.compare_digest(api_key, expected_key):
+    # Compare key: accept exact match, or either default key if default is configured
+    is_valid = False
+    if api_key:
+        if hmac.compare_digest(api_key, expected_key):
+            is_valid = True
+        elif expected_key in ("default_secret_key", "default_worker_secret") and api_key in ("default_secret_key", "default_worker_secret"):
+            is_valid = True
+
+    if not is_valid:
         return web.json_response(
-            {"error": "Unauthorized", "message": "Invalid or missing X-API-Key header"},
+            {
+                "error": "Unauthorized",
+                "message": "Invalid or missing X-API-Key header. Ensure your controller's API key matches WORKER_API_KEY on this worker node."
+            },
             status=401
         )
 
@@ -72,7 +87,10 @@ async def handle_health(request: web.Request) -> web.Response:
     net = psutil.net_io_counters()
 
     active_streams = stream_manager.list_active()
-    active_count = len([s for s in active_streams.values() if s.status in ("LIVE", "STARTING", "RECONNECTING")])
+    active_count = len([
+        s for s in active_streams.values()
+        if (s.is_running() if hasattr(s, "is_running") else s.status in ("LIVE", "STARTING", "RECONNECTING"))
+    ])
 
     return web.json_response({
         "status": "online",
@@ -92,29 +110,22 @@ async def handle_health(request: web.Request) -> web.Response:
         },
         "streaming": {
             "active_streams_count": active_count,
-            "total_sessions": len(active_streams)
+            "total_sessions": active_count
         }
     })
 
 async def handle_list_streams(request: web.Request) -> web.Response:
-    """Lists all streaming sessions on this worker node."""
+    """Lists all streaming sessions on this worker node with full Watchdog telemetry."""
     sessions_data = {}
-    for name, s in stream_manager.list_active().items():
-        sessions_data[name] = {
-            "channel_name": s.channel_name,
-            "status": s.status,
-            "video_path": str(s.video_path),
-            "video_name": s.video_path.name if s.video_path else "",
-            "uptime": s.uptime_str,
-            "loop": s.loop,
-            "reconnect_count": s.reconnect_count,
-            "codec_mode": s.codec_mode,
-            "error_message": s.error_message
-        }
+    for name, session in stream_manager.list_active().items():
+        if (hasattr(session, "is_running") and session.is_running()) or session.status in ("LIVE", "STARTING", "RECONNECTING"):
+            info = stream_manager.get_session_info(name)
+            if info:
+                sessions_data[name] = info
     return web.json_response({"streams": sessions_data})
 
 async def handle_start_stream(request: web.Request) -> web.Response:
-    """Starts FFmpeg live broadcast on this worker node."""
+    """Starts FFmpeg live broadcast on this worker node (Single Video or Playlist)."""
     try:
         data = await request.json()
     except Exception:
@@ -124,34 +135,57 @@ async def handle_start_stream(request: web.Request) -> web.Response:
     if not channel_name:
         return web.json_response({"error": "channel_name is required"}, status=400)
 
-    # 1. Resolve video file path
+    # 1. Resolve video file path or playlist items
     target_path: Optional[Path] = None
-    file_id = data.get("file_id")
-    video_path_str = data.get("video_path")
-    video_url = data.get("video_url")
+    playlist_files: List[Path] = []
+    playlist_names: List[str] = []
 
-    if file_id:
-        target_path = file_manager.get_file(file_id)
-    elif video_path_str:
-        candidate = Path(video_path_str)
-        if candidate.is_absolute():
-            target_path = candidate
-        else:
-            target_path = config.DOWNLOAD_DIR / candidate
+    playlist_raw = data.get("playlist_ids") or data.get("playlist")
+    if playlist_raw and isinstance(playlist_raw, list):
+        for item in playlist_raw:
+            p_file = None
+            if isinstance(item, str):
+                p_file = file_manager.get_file(item)
+                if not p_file:
+                    cand = Path(item)
+                    if cand.exists():
+                        p_file = cand
+                    elif (config.DOWNLOAD_DIR / cand.name).exists():
+                        p_file = config.DOWNLOAD_DIR / cand.name
+            if p_file and p_file.exists():
+                playlist_files.append(p_file)
+                playlist_names.append(p_file.name)
 
-    # If URL provided and no local file, download on this worker node
-    if not target_path or not target_path.exists():
-        if video_url:
-            logger.info(f"Downloading stream source video from {video_url}...")
-            try:
-                target_path = await download_video(video_url)
-            except Exception as e:
-                return web.json_response({"error": f"Failed to download video: {str(e)}"}, status=500)
-        else:
-            return web.json_response({"error": "Video file not found and no video_url provided"}, status=404)
+        if not playlist_files:
+            return web.json_response({"error": "None of the playlist videos were found on worker node"}, status=404)
+        target_path = playlist_files[0]
+    else:
+        file_id = data.get("file_id")
+        video_path_str = data.get("video_path")
+        video_url = data.get("video_url")
 
-    if not target_path or not target_path.exists():
-        return web.json_response({"error": "Video file not found on worker node"}, status=404)
+        if file_id:
+            target_path = file_manager.get_file(file_id)
+        elif video_path_str:
+            candidate = Path(video_path_str)
+            if candidate.is_absolute():
+                target_path = candidate
+            else:
+                target_path = config.DOWNLOAD_DIR / candidate
+
+        # If URL provided and no local file, download on this worker node
+        if not target_path or not target_path.exists():
+            if video_url:
+                logger.info(f"Downloading stream source video from {video_url}...")
+                try:
+                    target_path = await download_video(video_url)
+                except Exception as e:
+                    return web.json_response({"error": f"Failed to download video: {str(e)}"}, status=500)
+            else:
+                return web.json_response({"error": "Video file not found and no video_url provided"}, status=404)
+
+        if not target_path or not target_path.exists():
+            return web.json_response({"error": "Video file not found on worker node"}, status=404)
 
     # 2. Resolve RTMP URL
     rtmp_url = data.get("rtmp_url")
@@ -165,12 +199,16 @@ async def handle_start_stream(request: web.Request) -> web.Response:
     if quality_mode:
         settings_manager.set_quality(quality_mode)
 
-    logger.info(f"Starting live stream: [{channel_name}] -> {target_path.name} (Loop: {loop_setting}, Quality: {quality_mode})")
+    mode_label = f"Playlist ({len(playlist_files)} videos)" if playlist_files else target_path.name
+    logger.info(f"Starting live stream: [{channel_name}] -> {mode_label} (Loop: {loop_setting}, Quality: {quality_mode})")
+
     started = await stream_manager.start_stream(
         channel_name=channel_name,
         video_path=target_path,
         rtmp_url=rtmp_url,
-        loop=loop_setting
+        loop=loop_setting,
+        playlist_files=playlist_files if playlist_files else None,
+        playlist_names=playlist_names if playlist_names else None
     )
 
     if started:
@@ -179,6 +217,9 @@ async def handle_start_stream(request: web.Request) -> web.Response:
             "status": "success",
             "channel": channel_name,
             "stream_status": session.status if session else "STARTING",
+            "is_playlist": bool(playlist_files),
+            "playlist_count": len(playlist_files),
+            "now_playing": session.now_playing if session else target_path.name,
             "video_name": target_path.name
         })
     else:
@@ -216,6 +257,22 @@ async def handle_restart_stream(request: web.Request) -> web.Response:
     if restarted:
         return web.json_response({"status": "success", "channel": channel_name, "restarted": True})
     return web.json_response({"error": f"Could not restart channel [{channel_name}]"}, status=400)
+
+async def handle_skip_stream(request: web.Request) -> web.Response:
+    """Skips to the next video in an active playlist with seamless transition."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Malformed JSON body"}, status=400)
+
+    channel_name = data.get("channel_name", "").strip().lower()
+    if not channel_name:
+        return web.json_response({"error": "channel_name is required"}, status=400)
+
+    success, msg = await stream_manager.skip_next(channel_name)
+    if success:
+        return web.json_response({"status": "success", "channel": channel_name, "message": msg})
+    return web.json_response({"error": msg}, status=400)
 
 # --- FILE MANAGEMENT ROUTES ---
 
@@ -320,6 +377,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/streams/start", handle_start_stream)
     app.router.add_post("/api/streams/stop", handle_stop_stream)
     app.router.add_post("/api/streams/restart", handle_restart_stream)
+    app.router.add_post("/api/streams/skip", handle_skip_stream)
 
     # Files
     app.router.add_get("/api/files", handle_list_files)
@@ -332,13 +390,52 @@ def create_app() -> web.Application:
     app.router.add_post("/api/channels", handle_add_channel)
     app.router.add_delete("/api/channels/{name}", handle_delete_channel)
 
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
+
     return app
+
+async def background_resource_guard(app: web.Application):
+    """Background task: monitors host disk/RAM and purges inactive videos if near capacity."""
+    logger.info("🛡 Host Resource Guard active (monitoring RAM & Disk thresholds)")
+    try:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                mem = psutil.virtual_memory()
+                disk = psutil.disk_usage(str(config.DATA_DIR))
+                disk_max = getattr(config, "DISK_AUTO_CLEAN_PERCENT", 85.0)
+                ram_max = getattr(config, "RAM_AUTO_CLEAN_PERCENT", 88.0)
+
+                if disk.percent > disk_max or mem.percent > ram_max:
+                    logger.warning(
+                        f"⚠️ Resource guard triggered! Disk: {disk.percent}% (Limit: {disk_max}%), "
+                        f"RAM: {mem.percent}% (Limit: {ram_max}%). Purging inactive files..."
+                    )
+                    count, freed = file_manager.delete_all_inactive()
+                    logger.info(f"Purged {count} inactive files, freed {freed:.1f} MB to protect active streams.")
+            except Exception as e:
+                logger.debug(f"Resource guard error: {e}")
+    except asyncio.CancelledError:
+        pass
+
+async def start_background_tasks(app: web.Application):
+    app["resource_guard"] = asyncio.create_task(background_resource_guard(app))
+
+async def cleanup_background_tasks(app: web.Application):
+    task = app.get("resource_guard")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 if __name__ == "__main__":
     host = config.WORKER_HOST
     port = config.WORKER_PORT
     logger.info("==========================================================")
-    logger.info("  🚀 Starting 24/7 Live Stream Worker Node (Phase 2)")
+    logger.info("  🚀 Starting 24/7 Live Stream Worker Node (Watchdog & Playlist)")
     logger.info(f"  • Host: {host}")
     logger.info(f"  • Port: {port}")
     logger.info(f"  • API Key protection: {'Active' if config.WORKER_API_KEY else 'Disabled (Warning!)'}")

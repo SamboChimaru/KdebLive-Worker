@@ -54,7 +54,7 @@ ICON_LABELS = {
     "quality": "Quality Mode",
     "help": "Help",
     "live": "LIVE Indicator",
-    "admin": "Admin Fleet Panel",
+    "admin": "Admin Panel",
     # Sub-Menu Buttons & Actions
     "back": "Back (to Dashboard / Menu)",
     "cancel": "Cancel Action",
@@ -240,10 +240,10 @@ class SettingsManager:
 
     def get_quality_label(self) -> str:
         labels = {
-            "1080p": "1080p Full HD (4800k, 2s GOP)",
-            "720p": "720p HD (2800k, 2s GOP)",
+            "1080p": "1080p Full HD",
+            "720p": "720p HD",
             "copy": "Stream-Copy (Ultra-low CPU)"
         }
-        return labels.get(self.get_quality(), "1080p Full HD (4800k, 2s GOP)")
+        return labels.get(self.get_quality(), "1080p Full HD")
 
 settings_manager = SettingsManager()
