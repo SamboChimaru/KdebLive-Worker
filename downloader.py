@@ -73,12 +73,20 @@ def get_url_cache_path(url: str, content_disposition: Optional[str] = None) -> P
 
     return config.DOWNLOAD_DIR / original_name
 
-async def _notify_helper(cb, dl: int, total: int):
+async def _notify_helper(cb, dl: int, total: int, **kwargs):
     try:
         if inspect.iscoroutinefunction(cb):
-            await cb(dl, total)
+            sig = inspect.signature(cb)
+            if len(sig.parameters) > 2 or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+                await cb(dl, total, **kwargs)
+            else:
+                await cb(dl, total)
         else:
-            res = cb(dl, total)
+            sig = inspect.signature(cb)
+            if len(sig.parameters) > 2 or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+                res = cb(dl, total, **kwargs)
+            else:
+                res = cb(dl, total)
             if inspect.isawaitable(res):
                 await res
     except Exception as e:
@@ -96,15 +104,25 @@ def _sync_ytdlp_download(url: str, url_hash: str, loop, progress_callback) -> Pa
         status = d.get("status")
         if status == "downloading":
             now = time.time()
-            if (now - last_time[0]) < 1.0:
+            if (now - last_time[0]) < 0.5:
                 return
             last_time[0] = now
             dl = d.get("downloaded_bytes", 0)
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
-            asyncio.run_coroutine_threadsafe(_notify_helper(progress_callback, dl, total), loop)
+            speed = d.get("speed") or 0.0
+            eta = d.get("eta") or 0
+            fn = d.get("filename", "")
+            asyncio.run_coroutine_threadsafe(
+                _notify_helper(progress_callback, dl, total, speed=speed, eta=eta, filename=fn),
+                loop
+            )
         elif status == "finished":
             total = d.get("total_bytes") or d.get("downloaded_bytes", 0)
-            asyncio.run_coroutine_threadsafe(_notify_helper(progress_callback, total, total), loop)
+            fn = d.get("filename", "")
+            asyncio.run_coroutine_threadsafe(
+                _notify_helper(progress_callback, total, total, speed=0.0, eta=0, filename=fn),
+                loop
+            )
 
     ydl_opts = {
         "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
@@ -191,22 +209,30 @@ async def download_video(
                 total_size = int(response.headers.get("Content-Length", 0))
                 downloaded = 0
                 chunk_size = 512 * 1024  # 512 KB chunks
+                dl_start_time = time.time()
+                last_cb_time = [0.0]
 
-                await _notify_helper(progress_callback, 0, total_size)
+                await _notify_helper(progress_callback, 0, total_size, speed=0.0, eta=0)
 
                 with open(temp_path, "wb") as f:
                     async for chunk in response.content.iter_chunked(chunk_size):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            await _notify_helper(progress_callback, downloaded, total_size)
+                            now = time.time()
+                            if (now - last_cb_time[0]) >= 0.5 or (total_size > 0 and downloaded >= total_size):
+                                last_cb_time[0] = now
+                                elapsed = max(0.001, now - dl_start_time)
+                                speed = downloaded / elapsed
+                                eta = int((total_size - downloaded) / speed) if (speed > 0 and total_size > downloaded) else 0
+                                await _notify_helper(progress_callback, downloaded, total_size, speed=speed, eta=eta)
 
         # Rename temp file to target once complete
         if temp_path.exists():
             temp_path.rename(target_path)
 
         final_size = target_path.stat().st_size
-        await _notify_helper(progress_callback, final_size, final_size if total_size == 0 else total_size)
+        await _notify_helper(progress_callback, final_size, final_size if total_size == 0 else total_size, speed=0.0, eta=0)
 
         logger.info(f"Download complete: {target_path} ({final_size} bytes)")
         return target_path

@@ -1,12 +1,14 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import os
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from aiohttp import web
 import psutil
@@ -27,6 +29,66 @@ logging.basicConfig(
 logger = logging.getLogger("WorkerNode")
 
 WORKER_START_TIME = time.time()
+
+# --- DOWNLOAD PROGRESS TRACKING ---
+active_downloads: Dict[str, Dict[str, Any]] = {}
+
+def get_download_id(url: str) -> str:
+    unquoted = urllib.parse.unquote(url)
+    return hashlib.sha256(unquoted.encode("utf-8")).hexdigest()[:12]
+
+def make_download_tracker(url: str, custom_id: Optional[str] = None):
+    dl_id = custom_id or get_download_id(url)
+    start_t = time.time()
+    active_downloads[dl_id] = {
+        "id": dl_id,
+        "status": "downloading",
+        "url": url,
+        "downloaded_bytes": 0,
+        "total_bytes": 0,
+        "downloaded_mb": 0.0,
+        "total_mb": 0.0,
+        "percent": 0.0,
+        "speed_mb": 0.0,
+        "eta_seconds": 0,
+        "eta_str": "--",
+        "filename": "",
+        "start_time": start_t,
+        "updated_at": start_t,
+        "error": None
+    }
+
+    async def tracker_cb(dl: int, total: int, speed: float = 0.0, eta: int = 0, filename: str = "", **kwargs):
+        now = time.time()
+        info = active_downloads.get(dl_id)
+        if not info:
+            return
+
+        elapsed = max(0.001, now - info["start_time"])
+        if speed <= 0 and dl > 0:
+            speed = dl / elapsed
+
+        pct = round((dl / total) * 100, 1) if total > 0 else 0.0
+        if eta <= 0 and total > dl and speed > 0:
+            eta = int((total - dl) / speed)
+
+        eta_str = f"{eta // 60}m {eta % 60}s" if eta >= 60 else f"{eta}s" if eta > 0 else "--"
+
+        info.update({
+            "status": "finished" if (total > 0 and dl >= total) else "downloading",
+            "downloaded_bytes": dl,
+            "total_bytes": total,
+            "downloaded_mb": round(dl / (1024 * 1024), 1),
+            "total_mb": round(total / (1024 * 1024), 1),
+            "percent": pct,
+            "speed_mb": round(speed / (1024 * 1024), 2),
+            "eta_seconds": eta,
+            "eta_str": eta_str,
+            "filename": filename or info.get("filename", ""),
+            "updated_at": now
+        })
+
+    return dl_id, tracker_cb
 
 # --- SECURITY MIDDLEWARE ---
 
@@ -179,9 +241,30 @@ async def handle_start_stream(request: web.Request) -> web.Response:
         if not target_path or not target_path.exists():
             if video_url:
                 logger.info(f"Downloading stream source video from {video_url}...")
+                dl_id, tracker_cb = make_download_tracker(video_url, custom_id=file_id)
                 try:
-                    target_path = await download_video(video_url)
+                    target_path = await download_video(video_url, progress_callback=tracker_cb)
+                    if dl_id in active_downloads and target_path and target_path.exists():
+                        sz = target_path.stat().st_size
+                        sz_mb = round(sz / (1024 * 1024), 1)
+                        active_downloads[dl_id].update({
+                            "status": "finished",
+                            "percent": 100.0,
+                            "downloaded_bytes": sz,
+                            "total_bytes": sz,
+                            "downloaded_mb": sz_mb,
+                            "total_mb": sz_mb,
+                            "speed_mb": 0.0,
+                            "eta_seconds": 0,
+                            "eta_str": "0s",
+                            "filename": target_path.name
+                        })
                 except Exception as e:
+                    if dl_id in active_downloads:
+                        active_downloads[dl_id].update({
+                            "status": "error",
+                            "error": str(e)
+                        })
                     return web.json_response({"error": f"Failed to download video: {str(e)}"}, status=500)
             else:
                 return web.json_response({"error": "Video file not found and no video_url provided"}, status=404)
@@ -296,7 +379,7 @@ async def handle_list_files(request: web.Request) -> web.Response:
     return web.json_response({"files": files, "storage": storage})
 
 async def handle_download_file(request: web.Request) -> web.Response:
-    """Downloads a video file onto the worker node."""
+    """Downloads a video file onto the worker node with live progress tracking."""
     try:
         data = await request.json()
     except Exception:
@@ -307,15 +390,79 @@ async def handle_download_file(request: web.Request) -> web.Response:
         return web.json_response({"error": "url is required"}, status=400)
 
     try:
-        downloaded_path = await download_video(url)
+        dl_id, tracker_cb = make_download_tracker(url)
+        downloaded_path = await download_video(url, progress_callback=tracker_cb)
+        sz = downloaded_path.stat().st_size
+        sz_mb = round(sz / (1024 * 1024), 1)
+        if dl_id in active_downloads:
+            active_downloads[dl_id].update({
+                "status": "finished",
+                "percent": 100.0,
+                "downloaded_bytes": sz,
+                "total_bytes": sz,
+                "downloaded_mb": sz_mb,
+                "total_mb": sz_mb,
+                "speed_mb": 0.0,
+                "eta_seconds": 0,
+                "eta_str": "0s",
+                "filename": downloaded_path.name
+            })
         return web.json_response({
             "status": "success",
+            "download_id": dl_id,
             "filename": downloaded_path.name,
-            "size_bytes": downloaded_path.stat().st_size
+            "size_bytes": sz,
+            "size_mb": sz_mb
         })
     except Exception as e:
         logger.error(f"Download failed for {url}: {e}")
         return web.json_response({"error": str(e)}, status=500)
+
+async def handle_download_progress(request: web.Request) -> web.Response:
+    """Returns real-time download progress for a specific download ID, URL, or all active downloads."""
+    # Periodic cleanup of old finished/error downloads older than 10 minutes
+    now = time.time()
+    stale_keys = [k for k, v in active_downloads.items() if (v.get("status") in ("finished", "error") and (now - v.get("updated_at", 0)) > 600)]
+    for k in stale_keys:
+        active_downloads.pop(k, None)
+
+    dl_id = request.query.get("id", "").strip()
+    url = request.query.get("url", "").strip()
+
+    if url and not dl_id:
+        dl_id = get_download_id(url)
+
+    if dl_id:
+        # 1. Active or recently completed download in memory
+        info = active_downloads.get(dl_id)
+        if info:
+            return web.json_response(info)
+
+        # 2. Check if file is already completed and stored on disk
+        if config.DOWNLOAD_DIR.exists():
+            for p in config.DOWNLOAD_DIR.glob(f"{dl_id}_*"):
+                if p.is_file() and not p.name.endswith(".downloading") and not p.name.endswith(".part") and p.stat().st_size > 0:
+                    sz = p.stat().st_size
+                    sz_mb = round(sz / (1024 * 1024), 1)
+                    return web.json_response({
+                        "id": dl_id,
+                        "status": "finished",
+                        "percent": 100.0,
+                        "downloaded_bytes": sz,
+                        "total_bytes": sz,
+                        "downloaded_mb": sz_mb,
+                        "total_mb": sz_mb,
+                        "speed_mb": 0.0,
+                        "eta_seconds": 0,
+                        "eta_str": "0s",
+                        "filename": p.name
+                    })
+
+        return web.json_response({"id": dl_id, "status": "idle", "percent": 0.0})
+
+    return web.json_response({
+        "active_downloads": list(active_downloads.values())
+    })
 
 async def handle_delete_file(request: web.Request) -> web.Response:
     """Deletes a saved video file by file_id."""
@@ -443,9 +590,10 @@ def create_app() -> web.Application:
     app.router.add_post("/api/streams/restart", handle_restart_stream)
     app.router.add_post("/api/streams/skip", handle_skip_stream)
 
-    # Files
+    # Files & Downloads
     app.router.add_get("/api/files", handle_list_files)
     app.router.add_post("/api/files/download", handle_download_file)
+    app.router.add_get("/api/downloads/progress", handle_download_progress)
     app.router.add_delete("/api/files/clean", handle_clean_files)
     app.router.add_delete("/api/files/{file_id}", handle_delete_file)
 
