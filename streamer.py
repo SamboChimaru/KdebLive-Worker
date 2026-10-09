@@ -342,47 +342,61 @@ class StreamManager:
         return cmd
 
     async def _read_ffmpeg_output(self, session: StreamSession, proc: asyncio.subprocess.Process, log_file):
-        """Telemetry reader: parses real-time FPS, bitrate, and timecode for the Watchdog."""
+        """Telemetry reader: parses real-time FPS, bitrate, and timecode for the Watchdog (handles \\r and \\n)."""
         session.last_frame_time = time.time()
+        buf = ""
         try:
             while True:
-                line = await proc.stderr.readline()
-                if not line:
+                chunk = await proc.stderr.read(2048)
+                if not chunk:
                     break
-                text = line.decode("utf-8", errors="ignore")
-                log_file.write(line)
-                log_file.flush()
+                try:
+                    log_file.write(chunk)
+                    log_file.flush()
+                except Exception:
+                    pass
 
-                # Detect active video encoding frames
-                if "frame=" in text or "time=" in text or "bitrate=" in text:
-                    session.last_frame_time = time.time()
-                    session.health_state = "HEALTHY"
+                text = chunk.decode("utf-8", errors="ignore")
+                buf += text
 
-                    # FPS
-                    fps_m = re.search(r'fps=\s*([0-9.]+)', text)
-                    if fps_m:
-                        try:
-                            session.fps = float(fps_m.group(1))
-                        except ValueError:
-                            pass
+                # FFmpeg outputs progress separated by '\r' (carriage return), not '\n'
+                if "\r" in buf or "\n" in buf:
+                    parts = re.split(r'[\r\n]+', buf)
+                    buf = parts[-1]  # Keep incomplete tail
+                    for line in parts[:-1]:
+                        if not line.strip():
+                            continue
 
-                    # Bitrate
-                    br_m = re.search(r'bitrate=\s*([0-9.]+)\s*kbits/s', text)
-                    if br_m:
-                        try:
-                            session.bitrate_kbps = float(br_m.group(1))
-                        except ValueError:
-                            pass
+                        # Detect active video encoding frames
+                        if "frame=" in line or "time=" in line or "bitrate=" in line:
+                            session.last_frame_time = time.time()
+                            session.health_state = "HEALTHY"
 
-                    # Speed
-                    spd_m = re.search(r'speed=\s*([0-9.x]+)', text)
-                    if spd_m:
-                        session.speed = spd_m.group(1).strip()
+                            # FPS
+                            fps_m = re.search(r'fps=\s*([0-9.]+)', line)
+                            if fps_m:
+                                try:
+                                    session.fps = float(fps_m.group(1))
+                                except ValueError:
+                                    pass
 
-                    # Timecode
-                    tm_m = re.search(r'time=\s*([0-9:.]+)', text)
-                    if tm_m:
-                        session.timecode = tm_m.group(1).split(".")[0]
+                            # Bitrate
+                            br_m = re.search(r'bitrate=\s*([0-9.]+)\s*kbits/s', line)
+                            if br_m:
+                                try:
+                                    session.bitrate_kbps = float(br_m.group(1))
+                                except ValueError:
+                                    pass
+
+                            # Speed
+                            spd_m = re.search(r'speed=\s*([0-9.x]+)', line)
+                            if spd_m:
+                                session.speed = spd_m.group(1).strip()
+
+                            # Timecode
+                            tm_m = re.search(r'time=\s*([0-9:.]+)', line)
+                            if tm_m:
+                                session.timecode = tm_m.group(1).split(".")[0]
         except Exception as e:
             logger.debug(f"Telemetry reader finished for [{session.channel_name}]: {e}")
         finally:
@@ -408,7 +422,7 @@ class StreamManager:
         logger.info(f"Launching FFmpeg for [{session.channel_name}]: {' '.join(cmd[:8])} ...")
 
         try:
-            log_file = open(log_file_path, "wb")
+            log_file = open(log_file_path, "a+b")
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -462,7 +476,7 @@ class StreamManager:
 
     async def _monitor_stream(self, session: StreamSession):
         """24/7 Watchdog: proactively detects stalls (frozen 0 fps), drops, and auto-heals."""
-        stall_timeout = getattr(config, "STALL_TIMEOUT_SECONDS", 18)
+        stall_timeout = getattr(config, "STALL_TIMEOUT_SECONDS", 45)
         check_interval = getattr(config, "WATCHDOG_CHECK_INTERVAL", 3)
         max_auto_heal = getattr(config, "WATCHDOG_MAX_AUTO_HEAL", 50)
         max_consecutive = 3
