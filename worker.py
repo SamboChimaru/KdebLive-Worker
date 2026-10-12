@@ -351,8 +351,54 @@ async def handle_restart_stream(request: web.Request) -> web.Response:
 
     restarted = await stream_manager.restart_stream(channel_name)
     if restarted:
-        return web.json_response({"status": "success", "channel": channel_name, "restarted": True})
+        session = stream_manager.get_session(channel_name)
+        return web.json_response({
+            "status": "success",
+            "channel": channel_name,
+            "restarted": True,
+            "loop": session.loop if session else config.DEFAULT_LOOP,
+            "now_playing": session.now_playing if session else "",
+            "video_name": session.video_path.name if (session and session.video_path) else ""
+        })
     return web.json_response({"error": f"Could not restart channel [{channel_name}]"}, status=400)
+
+async def handle_set_loop(request: web.Request) -> web.Response:
+    """Updates loop setting for a specific active channel or all active channels on the worker."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Malformed JSON body"}, status=400)
+
+    channel_name = data.get("channel_name", "").strip().lower()
+    loop_val = data.get("loop")
+    if loop_val is None:
+        return web.json_response({"error": "loop boolean is required"}, status=400)
+
+    loop_bool = bool(loop_val)
+    config.DEFAULT_LOOP = loop_bool
+
+    if not channel_name or channel_name == "all":
+        active = stream_manager.list_active()
+        updated = []
+        for ch in list(active.keys()):
+            ok, _ = await stream_manager.set_loop(ch, loop_bool)
+            if ok:
+                updated.append(ch)
+        return web.json_response({
+            "status": "success",
+            "loop": loop_bool,
+            "updated_channels": updated
+        })
+
+    ok, msg = await stream_manager.set_loop(channel_name, loop_bool)
+    if ok:
+        return web.json_response({
+            "status": "success",
+            "channel": channel_name,
+            "loop": loop_bool,
+            "message": msg
+        })
+    return web.json_response({"error": msg}, status=404)
 
 async def handle_skip_stream(request: web.Request) -> web.Response:
     """Skips to the next video in an active playlist with seamless transition."""
@@ -588,6 +634,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/streams/start", handle_start_stream)
     app.router.add_post("/api/streams/stop", handle_stop_stream)
     app.router.add_post("/api/streams/restart", handle_restart_stream)
+    app.router.add_post("/api/streams/loop", handle_set_loop)
     app.router.add_post("/api/streams/skip", handle_skip_stream)
 
     # Files & Downloads

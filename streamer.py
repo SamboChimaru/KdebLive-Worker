@@ -42,11 +42,16 @@ class StreamSession:
         self.monitor_task: Optional[asyncio.Task] = None
         self.reader_task: Optional[asyncio.Task] = None
         self.start_time: float = 0.0
+        self.broadcast_start_time: float = 0.0
         self.status: str = "IDLE"  # IDLE, STARTING, LIVE, RECONNECTING, STOPPED, ERROR
         self.reconnect_count: int = 0
+        self.loop_count: int = 0
         self.is_manually_stopped: bool = False
         self.codec_mode: str = "auto"
         self.error_message: Optional[str] = None
+        self.video_duration: float = 0.0
+        self.launched_with_loop: bool = loop
+        self.stop_at_timecode_sec: Optional[float] = None
 
         # Watchdog & Health Telemetry
         self.last_frame_time: float = time.time()
@@ -54,9 +59,20 @@ class StreamSession:
         self.bitrate_kbps: float = 0.0
         self.speed: str = "1.0x"
         self.timecode: str = "00:00:00"
+        self.timecode_seconds: float = 0.0
         self.stall_count: int = 0
         self.last_healed_at: Optional[str] = None
         self.health_state: str = "HEALTHY"  # HEALTHY, WARNING, STALLED, RECOVERING
+
+    @property
+    def is_facebook(self) -> bool:
+        u = (self.rtmp_url or "").lower()
+        return "facebook.com" in u or "fbcdn.net" in u
+
+    @property
+    def is_youtube(self) -> bool:
+        u = (self.rtmp_url or "").lower()
+        return "youtube.com" in u or "youtu.be" in u
 
     @property
     def now_playing(self) -> str:
@@ -66,10 +82,17 @@ class StreamSession:
         return self.video_path.name if self.video_path else "Live Video"
 
     @property
+    def uptime_seconds(self) -> int:
+        ref_time = self.broadcast_start_time or self.start_time
+        if self.status not in ("LIVE", "RECONNECTING") or ref_time == 0:
+            return 0
+        return max(0, int(time.time() - ref_time))
+
+    @property
     def uptime_str(self) -> str:
-        if self.status != "LIVE" or self.start_time == 0:
+        elapsed = self.uptime_seconds
+        if elapsed <= 0 and self.status != "LIVE":
             return "0s"
-        elapsed = int(time.time() - self.start_time)
         hours, rem = divmod(elapsed, 3600)
         minutes, seconds = divmod(rem, 60)
         if hours > 0:
@@ -100,7 +123,11 @@ class StreamSession:
             "is_running": self.is_running(),
             "uptime": self.uptime_str,
             "uptime_str": self.uptime_str,
+            "uptime_seconds": self.uptime_seconds,
             "loop": self.loop,
+            "loop_count": self.loop_count,
+            "is_facebook": self.is_facebook,
+            "is_youtube": self.is_youtube,
             "codec_mode": self.codec_mode,
             "is_playlist": self.is_playlist,
             "playlist_count": len(self.playlist_files),
@@ -142,7 +169,7 @@ class StreamManager:
         return active_paths
 
     async def probe_video_info(self, video_path: Path) -> dict:
-        """Probes video using ffprobe to detect resolution, codecs, and stream properties."""
+        """Probes video using ffprobe to detect resolution, codecs, duration, and stream properties."""
         ffprobe_bin = shutil.which("ffprobe")
         default_info = {
             "vcodec": "unknown",
@@ -150,6 +177,7 @@ class StreamManager:
             "width": 1920,
             "height": 1080,
             "fps": 30.0,
+            "duration": 0.0,
             "has_audio": True,
             "is_aac": True
         }
@@ -161,6 +189,7 @@ class StreamManager:
                 ffprobe_bin,
                 "-v", "error",
                 "-show_streams",
+                "-show_format",
                 "-of", "json",
                 str(video_path)
             ]
@@ -172,6 +201,7 @@ class StreamManager:
             out, _ = await proc.communicate()
             data = json.loads(out.decode("utf-8", errors="ignore"))
             streams = data.get("streams", [])
+            fmt = data.get("format", {})
             v_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
             a_stream = next((s for s in streams if s.get("codec_type") == "audio"), {})
 
@@ -187,6 +217,12 @@ class StreamManager:
             else:
                 fps = float(fps_str or 30.0)
 
+            dur_raw = v_stream.get("duration") or fmt.get("duration") or 0.0
+            try:
+                duration = float(dur_raw)
+            except (ValueError, TypeError):
+                duration = 0.0
+
             has_audio = bool(a_stream)
             is_aac = acodec.lower() in ("aac", "mp4a")
 
@@ -196,6 +232,7 @@ class StreamManager:
                 "width": width,
                 "height": height,
                 "fps": fps,
+                "duration": duration,
                 "has_audio": has_audio,
                 "is_aac": is_aac
             }
@@ -215,23 +252,28 @@ class StreamManager:
             for i in range(count)
         ]
 
+        # Repeat playlist cycles inside ffconcat when loop is enabled so FFmpeg concat demuxer
+        # transitions gaplessly without hitting EOF between cycles
+        cycles = 100 if session.loop else 1
         lines = ["ffconcat version 1.0"]
-        for p in ordered_files:
-            # FFconcat expects forward-slashed paths safely formatted
-            clean_p = str(p.resolve()).replace('\\', '/')
-            lines.append(f"file '{clean_p}'")
+        for _ in range(cycles):
+            for p in ordered_files:
+                # FFconcat expects forward-slashed paths safely formatted with single quotes escaped
+                clean_p = str(p.resolve()).replace('\\', '/').replace("'", "'\\''")
+                lines.append(f"file '{clean_p}'")
 
         with open(manifest_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
         session.playlist_manifest_path = manifest_path
-        logger.info(f"Generated playlist manifest for [{session.channel_name}] with {len(ordered_files)} files at {manifest_path}")
+        logger.info(f"Generated playlist manifest for [{session.channel_name}] with {len(ordered_files)} files (loop={session.loop}) at {manifest_path}")
         return manifest_path
 
     def build_ffmpeg_cmd(self, session: StreamSession, video_info: dict, quality_mode: str = "1080p") -> list:
-        """Constructs FFmpeg command supporting Single Video, Concat Playlists, and strict 2s GOP."""
+        """Constructs FFmpeg command supporting Single Video, Concat Playlists, gapless looping, and strict 2s GOP."""
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
-        cmd = [ffmpeg_bin, "-re"]
+        # +genpts+igndts+discardcorrupt ensures smooth, monotonically increasing timestamps across -stream_loop wraps
+        cmd = [ffmpeg_bin, "-hide_banner", "-re", "-fflags", "+genpts+igndts+discardcorrupt"]
 
         # Input handling: Playlist Concat or Single File
         if session.is_playlist and len(session.playlist_files) > 1:
@@ -255,20 +297,42 @@ class StreamManager:
         vcodec = video_info.get("vcodec", "").lower()
         can_copy_v = (vcodec in ("h264", "avc1"))
 
-        # Meta Facebook Live & YouTube strictly mandate 48 kHz AAC audio
-        audio_args = ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]
+        # If source video has no audio track, generate silent 48kHz stereo audio so YouTube & Facebook
+        # do not reject or stall the RTMP stream
+        if not has_audio:
+            cmd.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
+
+        # Meta Facebook Live & YouTube strictly mandate 48 kHz AAC audio.
+        # aresample=async=1 prevents A/V timestamp drift and muxer stalls when looping videos 24/7 or 8h.
+        audio_args = [
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "48000",
+            "-ac", "2",
+            "-af", "aresample=async=1:min_hard_comp=0.100000:first_pts=0"
+        ]
+        silent_audio_args = [
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            *(["-shortest"] if not session.loop else []),
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "48000",
+            "-ac", "2"
+        ]
 
         # Mode handling
         if quality_mode == "copy" and not session.is_playlist and can_copy_v:
-            # Direct stream-copy only for single files with H.264 video codec
+            # Direct stream-copy for H.264 video; re-encode audio with async resampler when looping
+            # so slight audio/video length mismatches in MP4 never crash FLV muxer on loop wrap-around
             cmd.extend(["-c:v", "copy"])
             if has_audio:
-                if is_aac:
+                if is_aac and not session.loop:
                     cmd.extend(["-c:a", "copy"])
                 else:
                     cmd.extend(audio_args)
             else:
-                cmd.extend(["-an"])
+                cmd.extend(silent_audio_args)
             session.codec_mode = "Stream-Copy (Direct pass)"
 
         elif quality_mode == "720p" or (quality_mode == "copy" and not can_copy_v and (height <= 720 and width <= 1280)):
@@ -293,7 +357,7 @@ class StreamManager:
             if has_audio:
                 cmd.extend(audio_args)
             else:
-                cmd.extend(["-an"])
+                cmd.extend(silent_audio_args)
             session.codec_mode = "720p HD"
 
         else:
@@ -328,11 +392,13 @@ class StreamManager:
             if has_audio:
                 cmd.extend(audio_args)
             else:
-                cmd.extend(["-an"])
+                cmd.extend(silent_audio_args)
             session.codec_mode = f"{mode_name}"
 
-        # RTMP FLV output with packet flushing
+        # RTMP FLV output with monotonic zero-based timestamps and packet flushing
         cmd.extend([
+            "-avoid_negative_ts", "make_zero",
+            "-max_interleave_delta", "0",
             "-fflags", "+nobuffer+flush_packets",
             "-flvflags", "no_duration_filesize",
             "-f", "flv",
@@ -350,11 +416,6 @@ class StreamManager:
                 chunk = await proc.stderr.read(2048)
                 if not chunk:
                     break
-                try:
-                    log_file.write(chunk)
-                    log_file.flush()
-                except Exception:
-                    pass
 
                 text = chunk.decode("utf-8", errors="ignore")
                 buf += text
@@ -364,16 +425,17 @@ class StreamManager:
                     parts = re.split(r'[\r\n]+', buf)
                     buf = parts[-1]  # Keep incomplete tail
                     for line in parts[:-1]:
-                        if not line.strip():
+                        clean_line = line.strip()
+                        if not clean_line:
                             continue
 
                         # Detect active video encoding frames
-                        if "frame=" in line or "time=" in line or "bitrate=" in line:
+                        if "frame=" in clean_line or "time=" in clean_line or "bitrate=" in clean_line:
                             session.last_frame_time = time.time()
                             session.health_state = "HEALTHY"
 
                             # FPS
-                            fps_m = re.search(r'fps=\s*([0-9.]+)', line)
+                            fps_m = re.search(r'fps=\s*([0-9.]+)', clean_line)
                             if fps_m:
                                 try:
                                     session.fps = float(fps_m.group(1))
@@ -381,7 +443,7 @@ class StreamManager:
                                     pass
 
                             # Bitrate
-                            br_m = re.search(r'bitrate=\s*([0-9.]+)\s*kbits/s', line)
+                            br_m = re.search(r'bitrate=\s*([0-9.]+)\s*kbits/s', clean_line)
                             if br_m:
                                 try:
                                     session.bitrate_kbps = float(br_m.group(1))
@@ -389,14 +451,31 @@ class StreamManager:
                                     pass
 
                             # Speed
-                            spd_m = re.search(r'speed=\s*([0-9.x]+)', line)
+                            spd_m = re.search(r'speed=\s*([0-9.x]+)', clean_line)
                             if spd_m:
                                 session.speed = spd_m.group(1).strip()
 
                             # Timecode
-                            tm_m = re.search(r'time=\s*([0-9:.]+)', line)
+                            tm_m = re.search(r'time=\s*([0-9:.]+)', clean_line)
                             if tm_m:
-                                session.timecode = tm_m.group(1).split(".")[0]
+                                raw_tc = tm_m.group(1)
+                                session.timecode = raw_tc.split(".")[0]
+                                try:
+                                    tc_parts = raw_tc.split(":")
+                                    if len(tc_parts) == 3:
+                                        tc_sec = int(tc_parts[0]) * 3600 + int(tc_parts[1]) * 60 + float(tc_parts[2])
+                                        session.timecode_seconds = tc_sec
+                                        if session.video_duration > 1.0 and session.loop:
+                                            session.loop_count = int(tc_sec // session.video_duration)
+                                except Exception:
+                                    pass
+                        else:
+                            # Write non-telemetry diagnostic lines to log file (prevents multi-GB log bloat on 24/7 streams)
+                            try:
+                                log_file.write((clean_line + "\n").encode("utf-8", errors="ignore"))
+                                log_file.flush()
+                            except Exception:
+                                pass
         except Exception as e:
             logger.debug(f"Telemetry reader finished for [{session.channel_name}]: {e}")
         finally:
@@ -415,14 +494,18 @@ class StreamManager:
 
         target_for_probe = session.video_path if session.video_path else (session.playlist_files[0] if session.playlist_files else None)
         video_info = await self.probe_video_info(target_for_probe) if target_for_probe else {}
+        session.video_duration = float(video_info.get("duration", 0.0) or 0.0)
+        session.launched_with_loop = bool(session.loop)
+        session.stop_at_timecode_sec = None
+
         quality_mode = settings_manager.get_quality()
         cmd = self.build_ffmpeg_cmd(session, video_info=video_info, quality_mode=quality_mode)
 
         log_file_path = config.LOGS_DIR / f"{session.channel_name}_ffmpeg.log"
-        logger.info(f"Launching FFmpeg for [{session.channel_name}]: {' '.join(cmd[:8])} ...")
+        logger.info(f"Launching FFmpeg for [{session.channel_name}] (loop={session.loop}): {' '.join(cmd[:10])} ...")
 
         try:
-            log_file = open(log_file_path, "a+b")
+            log_file = open(log_file_path, "w+b")
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -430,6 +513,8 @@ class StreamManager:
             )
             session.process = process
             session.start_time = time.time()
+            if session.broadcast_start_time == 0.0:
+                session.broadcast_start_time = session.start_time
             session.last_frame_time = time.time()
             session.status = "LIVE"
             session.health_state = "HEALTHY"
@@ -475,10 +560,10 @@ class StreamManager:
             return False
 
     async def _monitor_stream(self, session: StreamSession):
-        """24/7 Watchdog: proactively detects stalls (frozen 0 fps), drops, and auto-heals."""
+        """24/7 Watchdog: proactively detects stalls (frozen 0 fps), drops, loop cycles, and auto-heals."""
         stall_timeout = getattr(config, "STALL_TIMEOUT_SECONDS", 45)
         check_interval = getattr(config, "WATCHDOG_CHECK_INTERVAL", 3)
-        max_auto_heal = getattr(config, "WATCHDOG_MAX_AUTO_HEAL", 50)
+        max_auto_heal = getattr(config, "WATCHDOG_MAX_AUTO_HEAL", 100)
         max_consecutive = 3
         consecutive_failures = 0
 
@@ -494,6 +579,26 @@ class StreamManager:
                 proc = session.process
                 if not proc:
                     session.status = "STOPPED"
+                    break
+
+                # Check if user toggled loop OFF mid-stream while FFmpeg was running with -stream_loop -1
+                if (
+                    not session.loop
+                    and session.launched_with_loop
+                    and session.stop_at_timecode_sec is not None
+                    and session.timecode_seconds >= session.stop_at_timecode_sec
+                ):
+                    session.is_manually_stopped = True
+                    session.status = "STOPPED"
+                    logger.info(f"Stream for [{session.channel_name}] reached end of current cycle after loop was set to OFF.")
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    if session.notify_callback:
+                        asyncio.create_task(session.notify_callback(
+                            f"🏁 Broadcast for <b>[{session.channel_name}]</b> has finished (Single Play completed)."
+                        ))
                     break
 
                 # 1. Process termination check
@@ -515,6 +620,23 @@ class StreamManager:
                             ))
                         break
 
+                    # Seamless loop fallback: if loop=True and FFmpeg exited cleanly with code 0
+                    # (e.g. concat playlist cycle finished or loop toggled ON mid-stream), relaunch immediately!
+                    if session.loop and return_code == 0:
+                        session.loop_count += 1
+                        logger.info(f"🔁 Seamless loop restart #{session.loop_count} for [{session.channel_name}]...")
+                        await asyncio.sleep(0.2)
+                        if session.is_manually_stopped:
+                            session.status = "STOPPED"
+                            break
+                        success = await self._launch_process(session)
+                        if success:
+                            consecutive_failures = 0
+                            continue
+
+                    # Check if Facebook 8-hour (28,800s) platform broadcast limit was reached
+                    is_fb_8h_limit = session.is_facebook and session.uptime_seconds >= 28500
+
                     consecutive_failures += 1
                     if config.AUTO_RECONNECT and session.reconnect_count < max_auto_heal and consecutive_failures <= max_consecutive:
                         session.reconnect_count += 1
@@ -527,7 +649,7 @@ class StreamManager:
                             f"🔄 <b>Watchdog Auto-Healing:</b> Reconnecting attempt {consecutive_failures}/{max_consecutive}..."
                         )
                         logger.info(alert_msg)
-                        if session.notify_callback:
+                        if session.notify_callback and not is_fb_8h_limit:
                             asyncio.create_task(session.notify_callback(alert_msg))
 
                         await asyncio.sleep(config.RECONNECT_DELAY_SECONDS)
@@ -545,10 +667,17 @@ class StreamManager:
                         else:
                             if consecutive_failures >= max_consecutive:
                                 session.status = "STOPPED"
-                                err_msg = (
-                                    f"❌ Stream for <b>[{session.channel_name}]</b> disconnected.\n"
-                                    f"Remote RTMP broadcast disconnected or stream ended by user."
-                                )
+                                if is_fb_8h_limit:
+                                    err_msg = (
+                                        f"🏁 <b>Facebook 8-Hour Broadcast Limit Reached for [{session.channel_name}]!</b>\n"
+                                        f"Facebook Live allows a maximum of 8 hours per live stream session. "
+                                        f"You can start a new live broadcast anytime!"
+                                    )
+                                else:
+                                    err_msg = (
+                                        f"❌ Stream for <b>[{session.channel_name}]</b> disconnected.\n"
+                                        f"Remote RTMP broadcast disconnected or stream ended by user."
+                                    )
                                 logger.warning(err_msg)
                                 if session.notify_callback:
                                     asyncio.create_task(session.notify_callback(err_msg))
@@ -556,18 +685,27 @@ class StreamManager:
                             continue
                     else:
                         session.status = "STOPPED"
-                        err_msg = (
-                            f"❌ Stream for <b>[{session.channel_name}]</b> stopped.\n"
-                            f"Remote RTMP broadcast disconnected or maximum retries reached."
-                        )
+                        if is_fb_8h_limit:
+                            err_msg = (
+                                f"🏁 <b>Facebook 8-Hour Broadcast Limit Reached for [{session.channel_name}]!</b>\n"
+                                f"Facebook Live allows a maximum of 8 hours per live stream session. "
+                                f"You can start a new live broadcast anytime!"
+                            )
+                        else:
+                            err_msg = (
+                                f"❌ Stream for <b>[{session.channel_name}]</b> stopped.\n"
+                                f"Remote RTMP broadcast disconnected or maximum retries reached."
+                            )
                         logger.warning(err_msg)
                         if session.notify_callback:
                             asyncio.create_task(session.notify_callback(err_msg))
                         break
 
-                # If process is running stably and emitting frames, reset consecutive failures
-                if proc.returncode is None and session.status == "LIVE" and (time.time() - session.start_time > 15):
+                # If process is running stably and emitting frames for >60s, reset failure counters
+                # so 24/7 YouTube streams can run for weeks/months without hitting a retry ceiling
+                if proc.returncode is None and session.status == "LIVE" and (time.time() - session.start_time > 60):
                     consecutive_failures = 0
+                    session.reconnect_count = 0
 
                 # 2. Freeze / Stall detection (process alive, but 0 frames emitted for > stall_timeout)
                 time_since_frame = time.time() - session.last_frame_time
@@ -633,6 +771,30 @@ class StreamManager:
                 except KeyError:
                     pass
 
+    async def set_loop(self, channel_name: str, loop: bool) -> Tuple[bool, str]:
+        """Dynamically updates loop mode on an active stream without interrupting playback."""
+        session = self.get_session(channel_name)
+        if not session:
+            return False, f"Channel [{channel_name}] is not currently streaming."
+
+        session.loop = bool(loop)
+        if session.is_playlist and len(session.playlist_files) > 1:
+            try:
+                self.create_playlist_manifest(session)
+            except Exception as e:
+                logger.debug(f"Could not update playlist manifest on set_loop: {e}")
+
+        if not session.loop and session.launched_with_loop and session.video_duration > 1.0:
+            # Calculate end of current video playback cycle so FFmpeg stops cleanly when current play ends
+            completed_cycles = max(1, int(session.timecode_seconds // session.video_duration) + 1)
+            session.stop_at_timecode_sec = max(session.timecode_seconds + 2.0, completed_cycles * session.video_duration - 0.5)
+        else:
+            session.stop_at_timecode_sec = None
+
+        mode_str = "ON (24/7 Infinite Loop)" if session.loop else "OFF (Single Play)"
+        logger.info(f"🔁 Updated loop for active channel [{channel_name}] -> {mode_str}")
+        return True, mode_str
+
     async def start_stream(
         self,
         channel_name: str,
@@ -657,6 +819,7 @@ class StreamManager:
             playlist_names=playlist_names
         )
         session.status = "STARTING"
+        session.broadcast_start_time = time.time()
         self.sessions[channel_name] = session
 
         success = await self._launch_process(session)
