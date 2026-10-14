@@ -298,7 +298,13 @@ class StreamManager:
         has_audio = video_info.get("has_audio", True)
         is_aac = video_info.get("is_aac", True)
         vcodec = video_info.get("vcodec", "").lower()
-        can_copy_v = (vcodec in ("h264", "avc1"))
+
+        # Orientation & Platform Bounds (Facebook / YouTube max 1920x1080 landscape, 1080x1920 portrait)
+        is_portrait = height > width and height > 0
+        max_w = 1080 if is_portrait else 1920
+        max_h = 1920 if is_portrait else 1080
+        # Stream-copy can only be used if video is H.264 AND does not exceed platform max resolution
+        can_copy_v = (vcodec in ("h264", "avc1")) and (width <= max_w and height <= max_h)
 
         # If source video has no audio track, generate silent 48kHz stereo audio so YouTube & Facebook
         # do not reject or stall the RTMP stream
@@ -340,7 +346,9 @@ class StreamManager:
 
         elif quality_mode == "720p" or (quality_mode == "copy" and not can_copy_v and (height <= 720 and width <= 1280)):
             # 720p HD mode with ultrafast preset, strict Constant Bitrate (CBR), and 2-second keyframe cadence (GOP = 60 @ 30fps)
-            vf_filter = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30" if session.is_playlist else "scale=-2:720,fps=30"
+            max_w_720 = 720 if is_portrait else 1280
+            max_h_720 = 1280 if is_portrait else 720
+            vf_filter = f"scale={max_w_720}:{max_h_720}:force_original_aspect_ratio=decrease,pad={max_w_720}:{max_h_720}:(ow-iw)/2:(oh-ih)/2,fps=30"
             cmd.extend([
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
@@ -366,10 +374,9 @@ class StreamManager:
 
         else:
             # 1080p Full HD mode with ultrafast preset to guarantee >= 1.0x real-time encoding on 2 vCPUs
-            if session.is_playlist:
-                vf_filter = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30"
-            elif height > 1080 or width > 1920:
-                vf_filter = "scale=-2:1080,fps=30"
+            # Any ultrawide (e.g. 2540x1080), 4K, or oversized video is strictly bounded into 1920x1080
+            if session.is_playlist or height > max_h or width > max_w:
+                vf_filter = f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease,pad={max_w}:{max_h}:(ow-iw)/2:(oh-ih)/2,fps=30"
             else:
                 vf_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30"
 

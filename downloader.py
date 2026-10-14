@@ -126,10 +126,11 @@ def _sync_ytdlp_download(url: str, url_hash: str, loop, progress_callback) -> Pa
 
     ydl_opts = {
         "format": (
-            "bestvideo[height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=1080][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[ext=mp4][vcodec^=avc1]/best[ext=mp4]/"
+            "bestvideo[width<=1920][height<=1080][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "bestvideo[width<=1920][height<=1080][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+            "bestvideo[width<=1920][height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[width<=1920][height<=1080]+bestaudio/"
+            "best[width<=1920][height<=1080][ext=mp4][vcodec^=avc1]/best[width<=1920][height<=1080][ext=mp4]/"
             "bestvideo[height<=1080]+bestaudio/best"
         ),
         "merge_output_format": "mp4",
