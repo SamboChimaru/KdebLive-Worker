@@ -58,6 +58,8 @@ class StreamSession:
         self.fps: float = 0.0
         self.bitrate_kbps: float = 0.0
         self.speed: str = "1.0x"
+        self.speed_val: Optional[float] = 1.0
+        self.low_speed_warnings: int = 0
         self.timecode: str = "00:00:00"
         self.timecode_seconds: float = 0.0
         self.stall_count: int = 0
@@ -137,6 +139,7 @@ class StreamSession:
             "fps": self.fps,
             "bitrate_kbps": self.bitrate_kbps,
             "speed": self.speed,
+            "speed_val": self.speed_val,
             "timecode": self.timecode,
             "stall_count": self.stall_count,
             "reconnect_count": self.reconnect_count,
@@ -336,18 +339,19 @@ class StreamManager:
             session.codec_mode = "Stream-Copy (Direct pass)"
 
         elif quality_mode == "720p" or (quality_mode == "copy" and not can_copy_v and (height <= 720 and width <= 1280)):
-            # 720p HD mode with strict Constant Bitrate (CBR) and 2-second keyframe cadence (GOP = 60 @ 30fps)
+            # 720p HD mode with ultrafast preset, strict Constant Bitrate (CBR), and 2-second keyframe cadence (GOP = 60 @ 30fps)
             vf_filter = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30" if session.is_playlist else "scale=-2:720,fps=30"
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", "veryfast",
+                "-preset", "ultrafast",
                 "-tune", "zerolatency",
+                "-threads", "2",
                 "-vf", vf_filter,
                 "-r", "30",
-                "-b:v", "2800k",
-                "-minrate", "2800k",
-                "-maxrate", "2800k",
-                "-bufsize", "2800k",
+                "-b:v", "2500k",
+                "-minrate", "2500k",
+                "-maxrate", "2500k",
+                "-bufsize", "2500k",
                 "-x264-params", "nal-hrd=cbr:force-cfr=1",
                 "-pix_fmt", "yuv420p",
                 "-g", "60",
@@ -361,7 +365,7 @@ class StreamManager:
             session.codec_mode = "720p HD"
 
         else:
-            # 1080p Full HD mode (Default) with strict Constant Bitrate (CBR)
+            # 1080p Full HD mode with ultrafast preset to guarantee >= 1.0x real-time encoding on 2 vCPUs
             if session.is_playlist:
                 vf_filter = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30"
             elif height > 1080 or width > 1920:
@@ -370,13 +374,14 @@ class StreamManager:
                 vf_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30"
 
             scale_args = ["-vf", vf_filter] if vf_filter else []
-            bitrate = "4500k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "2800k"
-            mode_name = "1080p Full HD" if bitrate == "4500k" else "720p HD"
+            bitrate = "3500k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "2500k"
+            mode_name = "1080p Full HD" if bitrate == "3500k" else "720p HD"
 
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", "veryfast",
+                "-preset", "ultrafast",
                 "-tune", "zerolatency",
+                "-threads", "2",
                 *scale_args,
                 "-r", "30",
                 "-b:v", bitrate,
@@ -454,6 +459,10 @@ class StreamManager:
                             spd_m = re.search(r'speed=\s*([0-9.x]+)', clean_line)
                             if spd_m:
                                 session.speed = spd_m.group(1).strip()
+                                try:
+                                    session.speed_val = float(session.speed.rstrip('x'))
+                                except ValueError:
+                                    pass
 
                             # Timecode
                             tm_m = re.search(r'time=\s*([0-9:.]+)', clean_line)
@@ -502,6 +511,14 @@ class StreamManager:
         cmd = self.build_ffmpeg_cmd(session, video_info=video_info, quality_mode=quality_mode)
 
         log_file_path = config.LOGS_DIR / f"{session.channel_name}_ffmpeg.log"
+        # Preserve previous session log if it exists before overwriting
+        if log_file_path.exists() and log_file_path.stat().st_size > 0:
+            prev_log_path = config.LOGS_DIR / f"{session.channel_name}_ffmpeg.prev.log"
+            try:
+                shutil.copyfile(log_file_path, prev_log_path)
+            except Exception:
+                pass
+
         logger.info(f"Launching FFmpeg for [{session.channel_name}] (loop={session.loop}): {' '.join(cmd[:10])} ...")
 
         try:
@@ -707,7 +724,30 @@ class StreamManager:
                     consecutive_failures = 0
                     session.reconnect_count = 0
 
-                # 2. Freeze / Stall detection (process alive, but 0 frames emitted for > stall_timeout)
+                # 2. Encoding Speed Under-Run / CPU Starvation check
+                # In live streaming, speed must stay close to 1.0x (>= 0.85x). If speed is < 0.80x for over 30s,
+                # the CPU cannot keep up with real-time broadcast and the stream will lag or freeze on the platform.
+                if proc.returncode is None and session.status == "LIVE" and (time.time() - session.start_time > 25):
+                    if session.speed_val is not None and session.speed_val > 0.0 and session.speed_val < 0.80:
+                        session.low_speed_warnings += 1
+                        if session.low_speed_warnings == 1 or session.low_speed_warnings % 20 == 0:
+                            plat = "Facebook" if session.is_facebook else ("YouTube" if session.is_youtube else "Live")
+                            warn_text = (
+                                f"⚠️ <b>CPU Encoding Lag on [{session.channel_name}]</b>\n"
+                                f"Encoding speed is <b>{session.speed}</b> ({session.fps:.1f} fps), below 1.0x real-time.\n"
+                                f"The server CPU is overloaded, which can cause video to lag or freeze on {plat}!\n"
+                                f"💡 <i>Tip: Set stream quality to 'Stream-Copy' in /quality for zero CPU load.</i>"
+                            )
+                            logger.warning(
+                                f"⚠️ Low encoding speed on [{session.channel_name}]: {session.speed} ({session.fps:.1f} fps). "
+                                f"Broadcast is falling behind real time!"
+                            )
+                            if session.notify_callback:
+                                asyncio.create_task(session.notify_callback(warn_text))
+                    else:
+                        session.low_speed_warnings = 0
+
+                # 3. Freeze / Stall detection (process alive, but 0 frames emitted for > stall_timeout)
                 time_since_frame = time.time() - session.last_frame_time
                 if time_since_frame > stall_timeout and session.status == "LIVE":
                     session.stall_count += 1

@@ -230,8 +230,8 @@ class SettingsManager:
 
     # Stream quality management
     def get_quality(self) -> str:
-        """Returns stream quality mode: '1080p', '720p', or 'copy'."""
-        return self._settings.get("stream_quality", "1080p")
+        """Returns stream quality mode: 'copy' (default auto), '1080p', or '720p'."""
+        return self._settings.get("stream_quality", "copy")
 
     def set_quality(self, mode: str):
         if mode in ("1080p", "720p", "copy"):
@@ -240,10 +240,10 @@ class SettingsManager:
 
     def get_quality_label(self) -> str:
         labels = {
+            "copy": "Stream-Copy (Ultra-low CPU)",
             "1080p": "1080p Full HD",
-            "720p": "720p HD",
-            "copy": "Stream-Copy (Ultra-low CPU)"
+            "720p": "720p HD"
         }
-        return labels.get(self.get_quality(), "1080p Full HD")
+        return labels.get(self.get_quality(), "Stream-Copy (Ultra-low CPU)")
 
 settings_manager = SettingsManager()
