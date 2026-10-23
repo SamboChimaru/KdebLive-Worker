@@ -349,6 +349,7 @@ class StreamManager:
             max_w_720 = 720 if is_portrait else 1280
             max_h_720 = 1280 if is_portrait else 720
             vf_filter = f"scale={max_w_720}:{max_h_720}:force_original_aspect_ratio=decrease,pad={max_w_720}:{max_h_720}:(ow-iw)/2:(oh-ih)/2,fps=30"
+            br_720 = "3000k" if session.is_youtube else "2500k"
             cmd.extend([
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
@@ -356,10 +357,10 @@ class StreamManager:
                 "-threads", "2",
                 "-vf", vf_filter,
                 "-r", "30",
-                "-b:v", "2500k",
-                "-minrate", "2500k",
-                "-maxrate", "2500k",
-                "-bufsize", "2500k",
+                "-b:v", br_720,
+                "-minrate", br_720,
+                "-maxrate", br_720,
+                "-bufsize", br_720,
                 "-x264-params", "nal-hrd=cbr:force-cfr=1",
                 "-pix_fmt", "yuv420p",
                 "-g", "60",
@@ -381,8 +382,11 @@ class StreamManager:
                 vf_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30"
 
             scale_args = ["-vf", vf_filter] if vf_filter else []
-            bitrate = "3500k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "2500k"
-            mode_name = "1080p Full HD" if bitrate == "3500k" else "720p HD"
+            if session.is_youtube:
+                bitrate = "4800k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "3000k"
+            else:
+                bitrate = "3500k" if (height >= 1080 or width >= 1920 or height == 0 or session.is_playlist) else "2500k"
+            mode_name = "1080p Full HD" if (bitrate in ("4800k", "3500k")) else "720p HD"
 
             cmd.extend([
                 "-c:v", "libx264",
